@@ -1,0 +1,660 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include "head_angle.h"
+#include "i2c.h"
+#include "motor_control.h"
+#include "serial_lib.h"
+#include "espnow.h"
+
+#define I2C_BAUD_RATE 403400 //I2C通信速度(bps)
+#define slaveAddr 0x10  //スレーブ側のアドレス
+#define SDA 23  //SDA
+#define SCL 22  //SCL
+
+#define UART_BAUD_RATE 115200 //Arduinoシリアルモニタ
+#define UART1_BAUD_RATE 57600 //コントロールソフト
+#define UART2_BAUD_RATE 115200  //長崎大コンピュータ
+
+#define CHANNEL 0
+
+//ESP入力端子
+#define posx 36 //zoom
+#define posy 39 //pitch
+#define posz 34 //yaw
+
+#define MAX_YAW 750                   //左限界
+#define MIN_YAW 570                   //右限界      
+#define MAX_PITCH 540                 //上限界
+#define MIN_PITCH 380                 //下限界
+#define MAX_ZOOM 1000                  //ズームアウト限界
+#define MIN_ZOOM 150                  //ズームイン限界
+#define REMOVE_POSITION  1015          //内視鏡を着脱する際
+#define CENTER_YAW ((MAX_YAW-MIN_YAW)/2+MIN_YAW)     //中央（ヨー角）
+#define CENTER_PITCH ((MAX_PITCH-MIN_PITCH)/2+MIN_PITCH)                //中央（ヨー角)
+
+#define HH_THR 800//kamisugi threshold
+
+//動作表示灯
+
+#define CTLCHK 32 //コントロールPC通信
+#define TGTCHK 33 //長崎大PC通信
+#define ITFCHK 25 //インターフェース通信
+#define MTXCHK 26 //LEDマトリクス通信
+#define DRVCHK 27 //モータ駆動信号通信
+#define BITCHK 14 //噛んでるかどうか
+
+#define OFF 0
+#define ON 1
+
+
+//pic-windows共通
+enum eCODE{ 
+  OFFSET,RESET,
+  START,STOP,
+  R_UP,R_DOWN,
+  L_UP,L_DOWN,
+  SPEED_UP,SPEED_DOWN,
+  SEND_DATA,DATA_CHECK,
+  NEUTRAL,
+  REMOVE_SCOPE,
+  UP,DOWN,
+  LEFT,RIGHT,ZOOM_IN,ZOOM_OUT,BREAK,
+  LEFTIN, LEFTOUT,RIGHTIN, RIGHTOUT,UPIN, UPOUT, DOWNIN, DOWNOUT
+};
+
+//動作命令通信用
+enum eDRIVE {
+  BRAKE,ACTION,
+  PITCH,YAW,ZOOM,
+  FORWARD,REVERSE,POSITION
+};
+
+
+/////////////////////state data///////////////////////
+unsigned int head_R,R_offset = 0,R_critical=10000;
+unsigned int   head_cdc_1,L_offset=0,cdc_1_critical=5000;
+int DX = 0,DY = 0,DZ = 0;//head posture angle
+int pitch_y = 0,yaw_z = 0,roll_x = 0;//Angle difference data
+int position_x,position_y,position_z;//potentiometer
+int ch1_offset=0,ch2_offset=0;//hanikami offset
+
+////////////////////flag data/////////////////////
+int offset_flag=0;//
+int training = 0;    //1ならI2C通信を行わない
+int head=OFF;//噛んでいるかどうかのフラグ　これによりマトリクスにデータを送る
+int hh_flag = OFF;//噛みすぎるとON
+int neutral=0;//モータをエンコーダの0位置にもっていく
+int encoder_offset=0;//モータエンコーダ初期化用
+int start_flag = OFF;
+int remove_scope=0;
+int tmp_position_z=0;  //取り除く前のズームユニットの位置
+int operation_status = 5;//システム状態　5:システム停止
+float speed_change = 1000.0f;//speed 変更
+float senser_threshold_per = 0.45f;//閾値％変更
+int modeselect=0;
+
+//ESPNOW data//
+uint8_t slaveMAC[6]= {0x30, 0xAE, 0xA4, 0x08, 0x7B, 0x18}; //LEDマトリクス側のMACアドレス
+esp_now_peer_info_t slave;
+
+
+//LEDマトリクス送信タイマ
+volatile int interruptCounter;
+hw_timer_t * timer = NULL;
+#define MatTMR 50000 //オフタイマー時間設定(us) 50ms
+
+
+//プロトタイプ宣言
+/*
+void now_state();
+void Drive();
+void read_position(void);
+void MatDrive();
+*/
+
+void now_state(){
+    int hh_critial = 0;//噛みすぎ防止の為の第二閾値
+    
+    //噛んでるかどうかの判定
+    hh_critial = cdc_1_critical + HH_THR;//噛みすぎ閾値設定
+    if(head_cdc_1 > cdc_1_critical){   //噛んだら
+        head = ON;
+        digitalWrite(BITCHK, HIGH);
+        if(head_cdc_1 > hh_critial){  //噛みすぎたら
+            hh_flag = ON;
+        }
+        else if(head_cdc_1 < hh_critial){ //噛みすぎ辞めたら
+        hh_flag = OFF;
+        }
+    }
+    else if (head_cdc_1 < cdc_1_critical){  //噛むのやめたら
+        head = OFF;
+        hh_flag = OFF;
+        digitalWrite(BITCHK, LOW);
+    }
+    //頭部角度の差分を求める
+    pitch_y = Pitch_diff(DY,head);
+    yaw_z = -Yaw_diff(DZ,head);
+    roll_x = Roll_diff(DX,head);
+}
+
+void Drive() {   //ドライブ関数
+    static int roll_flag = 0,I2C_count = 0; 
+    
+    if(modeselect==1 && position_x<MAX_YAW-50){
+      if(position_x>640 && position_x<680){
+        I2Csend3byte(slaveAddr, YAW, FORWARD, 30);       //左へ
+      }
+      else{
+        I2Csend3byte(slaveAddr, YAW, FORWARD, 22);       //左へ
+      }
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      I2Csend3byte(slaveAddr, ZOOM, BRAKE, 0);
+      Serial.println("YAW_LEFT");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==2 && position_x>MIN_YAW+50){
+      if(position_x>640 && position_x<680){
+        I2Csend3byte(slaveAddr, YAW, REVERSE, 30);        //右へ
+      }
+      else{
+        I2Csend3byte(slaveAddr, YAW, REVERSE, 22);        //右へ
+      }
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      I2Csend3byte(slaveAddr, ZOOM, BRAKE, 0);
+      Serial.println("YAW_RIGHT"); 
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==4 && position_y>MIN_PITCH+50){
+      if(position_y>450 && position_y<470){
+        I2Csend3byte(slaveAddr, PITCH, FORWARD, 30);       //下へ
+      }
+      else{
+        I2Csend3byte(slaveAddr, PITCH, FORWARD, 17);       //下へ
+      }
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, ZOOM, BRAKE, 0);
+      Serial.println("PITCH_DOWN");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==3 && position_y<MAX_PITCH-50){ 
+      if(position_y>450 && position_y<470){
+        I2Csend3byte(slaveAddr, PITCH, REVERSE, 30);       //上へ
+      }
+      else{
+        I2Csend3byte(slaveAddr, PITCH, REVERSE, 20);       //上へ
+      }
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, ZOOM, BRAKE, 0);
+      Serial.println("PITCH_UP");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==5 && position_z>MIN_ZOOM+150){     //引く
+      I2Csend3byte(slaveAddr, ZOOM, REVERSE, 15);
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      Serial.println("ZOOM_IN");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==6 && position_z<MAX_ZOOM-150){
+      I2Csend3byte(slaveAddr, ZOOM, FORWARD, 15);
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      Serial.println("ZOOM_OUT");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==7 && position_x<MAX_YAW-50 && position_z<MAX_ZOOM-150){
+      I2Csend3byte(slaveAddr, ZOOM, FORWARD, 15);
+      I2Csend3byte(slaveAddr, YAW, FORWARD, 22);
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      Serial.println("LEFT_IN");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==8 && position_x<MAX_YAW-50 && position_z>MIN_ZOOM+150){
+      I2Csend3byte(slaveAddr, ZOOM, REVERSE, 15);
+      I2Csend3byte(slaveAddr, YAW, FORWARD, 22);
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      Serial.println("LEFT_OUT");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==9 && position_x>MIN_YAW+50 && position_z<MAX_ZOOM-150){
+      I2Csend3byte(slaveAddr, ZOOM, FORWARD, 15);
+      I2Csend3byte(slaveAddr, YAW, REVERSE, 22);
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      Serial.println("RIGHT_IN");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==10 && position_x>MIN_YAW+50 && position_z>MIN_ZOOM+150){
+      I2Csend3byte(slaveAddr, ZOOM, REVERSE, 15);
+      I2Csend3byte(slaveAddr, YAW, REVERSE, 22);
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      Serial.println("RIGHT_OUT");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==11 && position_y<MAX_PITCH-50 && position_z<MAX_ZOOM-150){
+      I2Csend3byte(slaveAddr, ZOOM, FORWARD, 15);
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, PITCH, REVERSE, 20);
+      Serial.println("UP_IN");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==12 && position_y<MAX_PITCH-50 && position_z>MIN_ZOOM+150){
+      I2Csend3byte(slaveAddr, ZOOM, REVERSE, 15);
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, PITCH, REVERSE, 20);
+      Serial.println("UP_OUT");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==13 && position_y>MIN_PITCH+50 && position_z<MAX_ZOOM-150){
+      I2Csend3byte(slaveAddr, ZOOM, FORWARD, 15);
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, PITCH, FORWARD, 17);
+      Serial.println("DOWN_IN");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==14 && position_y>MIN_PITCH+50 && position_z>MIN_ZOOM+150){
+      I2Csend3byte(slaveAddr, ZOOM, REVERSE, 15);
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, PITCH, FORWARD, 17);
+      Serial.println("DOWN_OUT");
+      digitalWrite(DRVCHK, HIGH);
+    }
+    else if(modeselect==15){
+      int center_yaw = (MAX_YAW - MIN_YAW) / 2 + MIN_YAW;
+      int center_pitch = (MAX_PITCH - MIN_PITCH) / 2 + MIN_PITCH;
+  
+      while (abs(position_y - center_pitch) > center_pitch * 0.01) {
+        read_position();
+        Serial.println("REMOVE_NEUTRAL");
+        if ((position_y - center_pitch) > 0) { //上を向いていたら
+          I2Csend3byte(slaveAddr, PITCH, FORWARD, 15);  //下へ
+          Serial.println("REMOVE_NEWTRAL_DOWN");
+        }
+        else {                             //下を向いていたら
+          I2Csend3byte(slaveAddr, PITCH, REVERSE, 15);  //上へ
+          Serial.println("REMOVE_NEUTRAL_UP");
+        }
+      }
+
+      while (abs(position_x - center_yaw) > center_yaw * 0.01) {
+        read_position();
+        if ((position_x - center_yaw) > 0) { //左を向いていたら
+          I2Csend3byte(slaveAddr, YAW, REVERSE, 15);  //右へ
+          Serial.println("REMOVE_NEUTRAL_RIGHT");
+        }
+        else {                             //右を向いていたら
+          I2Csend3byte(slaveAddr, YAW, FORWARD, 15);  //左へ
+          Serial.println("REMOVE_NEUTRAL_LEFT");
+        }
+      }
+     }
+     else{
+      operation_status = 0;//停止表示
+      //それ以外は停止
+      I2Csend3byte(slaveAddr, PITCH, BRAKE, 0);
+      I2Csend3byte(slaveAddr, YAW, BRAKE, 0);
+      I2Csend3byte(slaveAddr, ZOOM, BRAKE, 0);
+      digitalWrite(DRVCHK,LOW);
+     }
+}
+
+
+void read_position(void)
+{
+  position_x = analogRead(posx)/4;  //0-4095 to 0-1023
+  position_y = analogRead(posy)/4;
+  position_z = analogRead(posz)/4;
+}
+
+void Serial1send2byte(int data)
+{
+  int serial_data[2];
+  serial_data[0] = data & 0x00ff;           //下位8ビットデータを代入
+  serial_data[1] = data >> 8;             //上位8ビットデータを代入
+  Serial1.write( serial_data[0] );          //下位8ビットデータを送信
+  Serial1.write( serial_data[1] );          //上位8ビットデータを送信
+}
+
+
+// 非同期シリアル受信用の関数(戻り値がデータ)
+int get_serial1_data( void ) 
+{
+  int data;
+  do{     
+    while(!Serial1.available()){}
+      data=Serial1.read();
+    return data;
+  }while( 1 );              
+}   
+
+
+// 送信コールバック
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+
+if(status == ESP_NOW_SEND_SUCCESS){
+ digitalWrite(MTXCHK, HIGH);
+}else{
+  digitalWrite(MTXCHK, LOW);
+}
+}
+
+// 受信コールバック
+void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
+ digitalWrite(ITFCHK, HIGH);
+  char macStr[18];
+  int DX1,DX2,DY1,DY2,DZ1,DZ2,c2o1,c2o2;
+  unsigned int head_cdc_11,head_cdc_12;
+  static int cnt=0;
+
+/*
+  //variable resistance
+  c2o1 = data[6];
+  c2o2 = data[7];
+  ch2_offset = c2o1 | (c2o2 << 8);
+*/
+  //degree roll
+  DX1 = data[0];
+  DX2 = data[1];
+  DX = DX1 | (DX2 << 8);
+  //degree pitch
+  DY1 = data[2];
+  DY2 = data[3];
+  DY = DY1| (DY2 << 8);
+  //degree yaw
+  DZ1 = data[4];
+  DZ2 = data[5];
+  DZ = DZ1 | (DZ2 << 8);
+  head_cdc_11 = data[6];
+  head_cdc_12 = data[7];
+  head_cdc_1 = head_cdc_11 | (head_cdc_12 << 8);
+
+/**********自動閾値設定******************************/
+        if(offset_flag == 1)
+            cdc_1_critical = autothreshold(1,head_cdc_1,cdc_1_critical,senser_threshold_per, cnt);
+        else
+            autothreshold(0,0,0,0.00f,0);
+
+  cnt++;
+
+  /*
+  //デバッグ用-------------------------------------
+  for ( int i = 0 ; i < data_len ; i++ ) {
+    Serial.print(data[i]);
+    Serial.print(" ");
+  }
+  Serial.println("");
+  //---------------------------------------------
+*/
+ digitalWrite(ITFCHK, LOW);
+}
+
+//一定時間経過に伴うタイマフラグセット
+void IRAM_ATTR TMRFLGSET() {
+  interruptCounter=1;
+}
+
+//一定時間経過に伴うLEDマトリクス駆動
+void MatDrive() {
+  interruptCounter=0;
+
+    int pool_p_x,pool_p_y,pool_p_z;
+    unsigned char p_x16,p_y16,p_z16,head16;
+    unsigned char sendxy,sendzh;
+    
+    
+    pool_p_x = position_x;
+    pool_p_y = position_y;
+    pool_p_z = position_z;
+    
+    if(pool_p_x >= MAX_YAW){
+        pool_p_x = MAX_YAW;
+    }
+    else if(pool_p_x <= MIN_YAW){
+        pool_p_x = MIN_YAW;
+    }
+    
+    if(pool_p_y >= MAX_PITCH){
+        pool_p_y = MAX_PITCH;
+    }
+    else if(pool_p_y <= MIN_PITCH){
+        pool_p_y = MIN_PITCH;
+    }
+    
+    if(pool_p_z >= MAX_ZOOM){
+        pool_p_z = MAX_ZOOM;
+    }
+    else if(pool_p_z <= MIN_ZOOM){
+        pool_p_z = MIN_ZOOM;
+    }
+    
+    p_x16= (pool_p_x-MIN_YAW) / ((MAX_YAW-MIN_YAW)/16);
+    p_y16= (pool_p_y-MIN_PITCH) / ((MAX_PITCH-MIN_PITCH)/16);
+    p_z16= (pool_p_z-MIN_ZOOM) / ((MAX_ZOOM-MIN_ZOOM)/16);
+
+    if(p_x16 >= 16) p_x16 =15;
+    if(p_y16 >= 16) p_y16 =15;
+    p_y16 = 15-p_y16;
+    if(p_z16 >= 16) p_z16 =15;
+    
+  
+//espnowで送信
+    uint8_t blebuf[10];//無線用のデータ格納場所
+    memset(blebuf,0,sizeof blebuf);  
+    blebuf[0]=(uint8_t)((int)p_y16 & 0xff);
+    blebuf[1]=(uint8_t)((int)p_x16 & 0xff);
+    blebuf[2]=(uint8_t)((int)p_z16 & 0xff);
+    blebuf[3]=(uint8_t)((int)head_cdc_1/256 & 0xff);
+    blebuf[4]=(uint8_t)((int)modeselect & 0xff);
+    blebuf[5]=(uint8_t)((int)(head) & 0xFF);
+    esp_err_t result = esp_now_send(slave.peer_addr, blebuf, sizeof(blebuf));
+    
+    delay(1);//入れた方が安定する
+    
+}
+
+void setup() {
+
+//UART0,1,2セットアップ
+  Serial.begin(UART_BAUD_RATE);
+  Serial1.begin(UART1_BAUD_RATE, SERIAL_8N1, 18, 19);
+  Serial2.begin(UART2_BAUD_RATE, SERIAL_8N1, 16, 17);
+  Serial.println("SETUP UART END");
+  
+  pinMode(posx, ANALOG);
+  pinMode(posy, ANALOG);
+  pinMode(posz, ANALOG);
+
+  pinMode(CTLCHK, OUTPUT);
+  pinMode(TGTCHK, OUTPUT);
+  pinMode(ITFCHK, OUTPUT);
+  pinMode(MTXCHK, OUTPUT);
+  pinMode(DRVCHK, OUTPUT);
+  pinMode(BITCHK, OUTPUT);
+
+
+// GGR
+  delay(10);
+  get_serial1_data();
+
+  Serial.println("SETUP PINMODE END");
+
+//I2Cセットアップ
+  Wire.begin(SDA, SCL); //I2Cに使うピンを設定
+  Wire.setClock(I2C_BAUD_RATE);  //I2Cボーレートを設定
+  delay(100);//スレーブ側の立ち上がりを待つ
+
+    Serial.println("SETUP I2C END");
+
+//タイマ初期化
+  timer = timerBegin(0, getApbFrequency() / 1000000, true);
+  timerAttachInterrupt(timer, &TMRFLGSET, true);
+  timerAlarmWrite(timer, MatTMR, true);  //オフタイマー時間設定
+  timerAlarmEnable(timer);
+  
+//ESPNOWセットアップ
+  WiFi.mode(WIFI_STA);
+  
+  InitESPNow();
+    
+// マルチキャスト用Slave登録
+  memset(&slave, 0, sizeof(slave));
+  for (int i = 0; i < 6; ++i) {
+    slave.peer_addr[i] = slaveMAC[i];
+  }
+  esp_err_t addStatus = esp_now_add_peer(&slave);
+  if (addStatus == ESP_OK) {
+    // Pair success
+    Serial.println("SETUP ESPNOW MATRIX PAIRING END");
+  }
+  slave.channel = CHANNEL;
+
+// ESP-NOWコールバック登録
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
+
+  Serial.println("SETUP ESPNOW CALLBACK END");
+}
+
+void loop() {
+//コントロールPCからのUART受信イベント
+
+if(Serial1.available()){
+  digitalWrite(CTLCHK,HIGH);
+  switch(Serial1.read()){
+    case SEND_DATA:
+      Serial1.write(DATA_CHECK);                    //確認
+      Serial1send2byte(ch2_offset+3000);            //死
+      Serial1send2byte(head_cdc_1);                 //head_cdc_1筋電センサ値
+      Serial1send2byte(roll_x);                     //ロール角roll_x
+      Serial1send2byte(yaw_z);                      //ヨー角
+      Serial1send2byte(pitch_y);                    //ピッチ角
+      Serial1send2byte(cdc_1_critical);             //閾値
+      Serial1send2byte(head_R);                    
+      Serial1send2byte((int)speed_change);
+      Serial1send2byte((int)(senser_threshold_per*100));
+      Serial1send2byte( position_y );               //ピッチ移動値
+      Serial1send2byte( position_x );               //ヨー移動値
+      Serial1send2byte( position_z );               //zoom移動値
+      Serial1send2byte(operation_status);  
+      Serial1.write(DATA_CHECK);                    //確認
+      break;
+
+    case OFFSET:                                       //グラフautoset
+      offset_flag=1;
+      break;
+
+    case RESET:                                        //スレッショルド解放
+      offset_flag=0;
+      cdc_1_critical=5000;
+            autothreshold(0,0,0,0.00f,0);
+      break;
+    
+    case START:                                   //Start
+      start_flag = ON;
+      break;
+            
+    case STOP://Stop
+      start_flag = OFF;
+      break;
+            
+    case NEUTRAL:                                  //モータのencoderが0になるように回転させる
+      modeselect=15;
+      if(neutral == 0) neutral = 1;
+      else neutral = 0;   
+      break;
+  
+    case REMOVE_SCOPE:                           
+      if(remove_scope == 0) {
+                remove_scope = 1;
+                tmp_position_z = position_z;
+                if(tmp_position_z > MAX_ZOOM) tmp_position_z = MIN_ZOOM;        //取り外し時から始めた場合 
+            }
+      else remove_scope = 0;    
+            break;
+
+    case LEFT:
+      modeselect=1;
+      break;
+
+    case RIGHT:
+      modeselect=2;
+      break;
+
+    case UP:
+      modeselect=3;
+      break;
+
+    case DOWN:
+      modeselect=4;
+      break;
+
+    case ZOOM_IN:
+      modeselect=5;
+      break;
+
+    case ZOOM_OUT:
+      modeselect=6;
+      break;
+
+    case LEFTIN:
+      modeselect=7;
+      break;
+    
+    case LEFTOUT:
+      modeselect=8;
+      break;
+
+    case RIGHTIN:
+      modeselect=9;
+      break;
+
+    case RIGHTOUT:
+      modeselect=10;
+      break;
+
+    case UPIN:
+      modeselect=11;
+      break;
+
+    case UPOUT:
+      modeselect=12;
+      break;
+
+    case DOWNIN:
+      modeselect=13;
+      break;
+
+    case DOWNOUT:
+      modeselect=14;
+      break;
+      
+    case BREAK:
+      modeselect=0;
+      break;
+
+  }
+  digitalWrite(CTLCHK,LOW);
+}
+
+        now_state();     //噛んでるかどうか
+        read_position(); //位置検出
+        //digitalWrite(I2CCHK, LOW);         //I2C check
+        if(start_flag == ON){                //windows指令(start)
+            if(training == 0){               //I2C(0:communication ON 1:communication OFF主にデバック時に使う)
+                operation_status = 0;        //設定中からブレーキ状態へ
+                Drive();                     //moter drive
+            }
+        }
+        else{
+            operation_status = 5;//設定中
+            //nomal break
+            I2Csend3byte(slaveAddr, PITCH,BRAKE,0);
+            I2Csend3byte(slaveAddr, YAW,BRAKE,0);
+            I2Csend3byte(slaveAddr, ZOOM,BRAKE,0);
+        }
+
+  if (interruptCounter != 0) {
+    MatDrive();
+  }
+}
